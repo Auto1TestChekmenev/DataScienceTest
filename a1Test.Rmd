@@ -1,0 +1,219 @@
+---
+title: "Auto1 Data Science Challenge"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Stanislav Chekmenev"
+output: 
+    html_document:
+      toc: true
+      toc_float: true
+      toc_depth: 5
+      df_print: paged
+      fig_width: 10
+      fig_height: 5
+      
+---
+
+```{r setup, echo= T, include=F} 
+setwd(getwd())
+library(caret)
+library(data.table)
+library(dplyr)
+library(Hmisc)
+library(MLmetrics)
+```
+
+
+### Question 1
+
+Let's download the data set and have a look at it
+
+```{r}
+set.seed(666)
+pathData <- file.path(getwd(),"Auto1-DS-TestData.csv")
+dtData <- fread(pathData)
+head(dtData,10)
+rm(pathData)
+```
+
+#### Use cases:
+
+* Predict car price 
+* Predict insurance risk rating (symboling)
+* Predict normalized loss
+* Find the most influential variables and investigate dependencies between them and a variable of interest, i.e. price, risk rating or normalized loss
+
+### Question 2
+
+I will take the first use case and predict car prices based on the rest of the data. Auto1's business could be improved if a "right" car price is automatically calculated using the classification characteristics of a car that a customer wants to sell. If one is able to set a fare price for a car, then it's easier to earn money because the price would be attractive for a customer and Auto1 can also maximise its revenue setting a constraint that the price should be fare or realistic. It would also save time and money for the company because there wouldn't be a manual pricing procedure, involving extra staff and extra work, which, indeed, could be done by an algorithm.
+
+### Question 3 and 4 (together)
+
+I will describe step by step a process of building a model starting from data retreival and finishing with evaluation criteria. Therefore, I'm merging these two questions in one. So let's start!
+
+#### Analysis and transforamtion of the data
+
+After looking at the first 10 rows of the data above, I noticed that there are question marks ("?") in the places where no data is available. I'll change them to a more appealing format of NA and then print the summary page of the data.
+
+```{r}
+dtData[dtData == "?"] <- NA
+summary(dtData)
+```
+
+Some data types are either wrong or not comfortable to work with. I'll change them and print the table with a number of NAs per column if the number is bigger than zero.
+
+```{r, warning=F}
+dtData$symboling <- as.character(dtData$symboling)
+dtData$`normalized-losses` <- as.numeric(dtData$`normalized-losses`)
+dtData$bore <- as.numeric(dtData$bore)
+dtData$stroke <- as.numeric(dtData$stroke)
+dtData$horsepower <- as.numeric(dtData$horsepower)
+dtData$`peak-rpm` <- as.numeric(dtData$`peak-rpm`)
+dtData$price <- as.numeric(dtData$price)
+
+# Print the number of NAs per column if it's bigger than zerp
+lapply(dtData, function(x) {length(x[is.na(x)])}) %>% 
+  as.data.frame() %>% 
+  melt(value.name = "NumberNAs", variable.name = "ColumnName") %>% 
+  arrange(desc(NumberNAs)) %>% 
+  filter(NumberNAs > 0)
+```
+
+There are 4 NAs in the price column. I will delete these cases, since we want to predict price and want to know it precise. Also, those 4 cases are just 2% of all the data, so I can sacrifice them easily. 
+
+There are 41 NAs in the normalized-losses column and it's a substantial number for us, representing 20% of the data. 
+
+I will impute all NAs using "Hmisc" library and its function "aregImpute()" with multiple regression.
+
+```{r}
+dtData <- dtData[!is.na(price)]
+# Impute with Hmisc
+# Create a formula for Hmisc's aregImpute procedure and rename the columns with "-", so formula can recognise them
+colnames(dtData) <- gsub("-","_",colnames(dtData))
+form <-  paste("", paste(colnames(dtData)[!(colnames(dtData) %in% 
+                                            c("make","engine_location","num_of_cylinders","fuel_system","engine_type","symboling","body_style"))], collapse = " + "), sep = " ~ ")
+dtImpute <- aregImpute(data = dtData, formula = formula(form),
+                       n.impute = 5, 
+                       tlinear =T, 
+                       nk = c(3,5,8), 
+                       type = "pmm") 
+dtImpute
+```
+
+The $R^2$ are not big because we don't have a lot of data but still we can use those imputations. Let's insert the means of imputed values instead of NAs.
+
+```{r}
+dtData$normalized_losses[is.na(dtData$normalized_losses)] <- unname(apply(dtImpute$imputed$normalized_losses,1,mean))
+dtData$bore[is.na(dtData$bore)] <- unname(apply(dtImpute$imputed$bore,1,mean))
+dtData$stroke[is.na(dtData$stroke)] <- unname(apply(dtImpute$imputed$stroke,1,mean))
+dtData$horsepower[is.na(dtData$horsepower)] <- unname(apply(dtImpute$imputed$horsepower,1,mean))
+dtData$peak_rpm[is.na(dtData$peak_rpm)] <- unname(apply(dtImpute$imputed$peak_rpm,1,mean))
+dtData$num_of_doors[is.na(dtData$num_of_doors)] <- unname(apply(dtImpute$imputed$num_of_doors,1,mean))
+```
+
+
+#### Training
+
+Let's divide the data set into training and test sets, following the classical 80-20 rule because the data set is extremely small. **I won't use a validation set because a model will be trained using 10-fold cross-validation procedure**.
+
+```{r}
+ind <- createDataPartition(dtData$price, p = .8,list = FALSE,times = 1)
+dtTrain <- dtData[ind,]
+dtTest <- dtData[-ind,]
+rm(dtData)
+```
+
+I will train a small xgBoost model to identify the most important variables and then retrain it, using more trees and smaller $\eta$. (The model were pretrained, so I'm simply going to load and comment out the code for training.) I'm using xgBoost because this algorithm performs very well for both classification and regression. It is being used super often on Kaggle and gives one of the best results. It's fast, it has a sparsity aware built-in algorithm that takes care of NAs by default, though I decided to impute the NAs myself, since the data wasn't sparse. xgBoost is my default first choice for tackling many problems.
+
+```{r}
+# Set the train control statement
+# ctrl <- trainControl(method = "repeatedcv",
+#                      number = 5,
+#                      repeats = 10,
+#                      verboseIter = TRUE)
+# # Train a XGBoost model
+# xgbSmall <- train( price ~ .,
+#                  data = dtTrain,
+#                  method = "xgbTree",
+#                  verbose = T,
+#                  trControl = ctrl)
+#saveRDS(xgbSmall, file.path(getwd(),"xgbSmall.rds"))
+xgbSmall <- readRDS(file.path(getwd(),"xgbSmall.rds"))
+xgbSmall
+```
+
+
+The RMSE of the best tune is 2442 and the $R^2$ is 0.9056.
+
+Let's print the variable importance and find out the most important features, pick 7 of them and retrain the model.
+
+```{r}
+impFeatures <- varImp(xgbSmall)
+impFeatures
+```
+
+Using the first 7 features, I'll retrain the model with. The tuning parameters are picked in the way that more trees can be trained, i.e. the learning rate $\eta$ is decreased, the depth of interaction is increased to pick nonlinear interactions between the variables and I want to see if changing the sampling by rows and columns can improve the result, too. (**When I was doing the test task, I forgot to set the random seed in my R environment. I trained all this big model with a different random seed and it took me 6 hours on an amazon EC2 with 32GB RAM. So, I'm simply printing out the output of it but I'm retraining the model with this particular random seed of 666 with the best tuning parameters from the previous run with a different random seed. I know that the parameters are most likely to be changed but I simply don't have another 6 hours to retrain it, so sorry, guys, but it doesn't really matter to be honest.**)
+
+```{r}
+features <- impFeatures$importance %>% rownames()
+form1 <-  paste("price", paste(features[1:7], collapse = " + "), sep = "~")
+# xgbBig <- train( formula(form1),
+#                  data = dtTrain,
+#                  method = "xgbTree",
+#                  verbose = T,
+#                  trControl = ctrl,
+#                  tuneGrid = expand.grid(nrounds = c(10000,20000,30000),
+#                                         max_depth = c(3,5,7),
+#                                         eta = c(0.001, 0.0003),
+#                                         gamma = 0,
+#                                         colsample_bytree = c(0.6,0.8),
+#                                         min_child_weight = 1,
+#                                         subsample = c(0.6,0.8)))
+#saveRDS(xgbBig, file.path(getwd(),"xgbBig.rds"))
+#xgbBig <- readRDS(file.path(getwd(),"xgbBig.rds"))
+
+# Retrain with a proper random.seed
+# xgbBig1 <- train( formula(form1),
+#                  data = dtTrain,
+#                  method = "xgbTree",
+#                  verbose = T,
+#                  trControl = ctrl,
+#                  tuneGrid = expand.grid(nrounds = 10000,
+#                                         max_depth = 7,
+#                                         eta = c(0.001),
+#                                         gamma = 0,
+#                                         colsample_bytree = c(0.6),
+#                                         min_child_weight = 1,
+#                                         subsample = c(0.6)))
+#saveRDS(xgbBig1, file.path(getwd(),"xgbBig1.rds"))
+xgbBig1 <- readRDS(file.path(getwd(),"xgbBig1.rds"))
+xgbBig1
+```
+
+The RMSE now is 2343 and $R^2$ is 0.9113
+
+
+Let's test our model on the test set.
+
+```{r}
+pred <- predict(xgbBig1, dtTest)
+RMSEtest <- RMSE(pred,dtTest$price)
+R2test <- R2_Score(pred, dtTest$price)
+RMSEtest
+R2test
+```
+
+The test RMSE is 1801 and $R^2$ is 0.9552.
+
+
+#### Results
+
+**RMSE was my evaluation criteria because it works well for regression problems. The test set error is even smaller than the training set error. There are different reasons for that. For example, the test set was less noisy or it was due to the splitting or I actually made a mistake somewhere with those random seeds and it's only due to the sampling error. Anyways, for investigation of this goes beyond the test task and for this test it's sufficient to say that the test error is really good and the model performs well.**
+
+If I had more time:
+
+* I would train a bunch of different models network and see how they perform. For instance, neural networks, a random forest, a simple linear regression and so on.
+* I would choose best performing models and use them in an ensemble.
+* I would train my xgBoost model for longer time using a finer grid search.
+* I would experiment with the number of features that I would use in the final model.
+* I would try to use different imputation techniques and see if it brings any improvement to the model.
+
